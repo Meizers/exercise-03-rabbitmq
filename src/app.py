@@ -1,13 +1,21 @@
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from fastapi import Depends, FastAPI, HTTPException, Response
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 from src.database import Base, engine, get_db
+from src.events import NODE_DELETED, NODE_REGISTERED, publisher
 from src.models import Node
 from src.schemas import NodeCreate, NodeResponse, NodeUpdate
 
 Base.metadata.create_all(bind=engine)
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    yield
+    publisher.close()
+
+app = FastAPI(lifespan=lifespan)
 
 @app.get("/health")
 def health(db: Session = Depends(get_db)):
@@ -28,6 +36,8 @@ def register_node(node: NodeCreate, db: Session = Depends(get_db)):
     db.add(db_node)
     db.commit()
     db.refresh(db_node)
+    # Published after the commit, so consumers never hear about a node that was rolled back.
+    publisher.publish(NODE_REGISTERED, db_node.name)
     return db_node
 
 @app.get("/api/nodes", response_model=list[NodeResponse])
@@ -60,14 +70,12 @@ def delete_node(name: str, db: Session = Depends(get_db)):
     node = db.query(Node).filter(Node.name == name).first()
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
+    # DELETE stays idempotent (204 every time), but only the active -> inactive
+    # transition is an event; repeating it must not announce the node leaving twice.
+    was_active = node.status == "active"
     node.status = "inactive"
     node.updated_at = datetime.now(timezone.utc)
     db.commit()
+    if was_active:
+        publisher.publish(NODE_DELETED, node.name)
     return Response(status_code=204)
-
-# TODO: After each POST /api/nodes (register) and DELETE /api/nodes/{name},
-# publish an event to RabbitMQ with this format:
-# {"event": "node_registered" or "node_deleted", "node_name": "<name>", "timestamp": "<ISO8601>"}
-#
-# Use pika to connect to RabbitMQ at RABBITMQ_URL env var.
-# Queue name: "node_events"

@@ -1,7 +1,68 @@
-# TODO: Define 4 services: db, api, rabbitmq, consumer
-#
-# Requirements:
-# - db: postgres:17-alpine
-# - rabbitmq: rabbitmq:3-management, ports 5672 and 15672
-# - api: depends_on db and rabbitmq
-# - consumer: depends_on rabbitmq
+# Credentials are interpolated from .env (copy .env.example first); none live in this file.
+# Each service only receives the variables it actually uses.
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    restart: unless-stopped
+    # RabbitMQ names its data directory after the node name, which comes from the
+    # hostname: a fixed one keeps the durable queue across container re-creation.
+    hostname: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      # Stricter than `ping`: passes only once every listener, AMQP (5672) and
+      # the management API (15672), accepts connections.
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_port_connectivity"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 20s
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:?set DATABASE_URL in .env}
+      RABBITMQ_URL: ${RABBITMQ_URL:?set RABBITMQ_URL in .env}
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  consumer:
+    build:
+      context: ./consumer
+    restart: unless-stopped
+    environment:
+      RABBITMQ_URL: ${RABBITMQ_URL:?set RABBITMQ_URL in .env}
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
